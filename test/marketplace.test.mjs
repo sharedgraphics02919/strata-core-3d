@@ -1,0 +1,54 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { once } from 'node:events';
+
+test('marketplace workflows and permission boundaries',async t=>{
+ const directory=mkdtempSync(join(tmpdir(),'strata-test-'));
+ const port=33000+Math.floor(Math.random()*2000),origin=`http://localhost:${port}`;
+ const env={...process.env,DATA_DIR:directory,PORT:String(port),APP_ORIGIN:origin,HOST:'127.0.0.1',DEMO_CHECKOUT:'true',NODE_ENV:'test'};
+ const child=spawn(process.execPath,['server/index.mjs'],{env,stdio:['ignore','pipe','pipe']});
+ let stderr='';child.stderr.on('data',d=>stderr+=d);
+ t.after(async()=>{child.kill();if(child.exitCode===null)await once(child,'exit');const resolved=resolve(directory);assert.ok(resolved.startsWith(resolve(tmpdir()))&&resolved.includes('strata-test-'));rmSync(resolved,{recursive:true,force:true});});
+ await new Promise((yes,no)=>{const timer=setTimeout(()=>no(new Error('Server did not start: '+stderr)),10000);child.stdout.on('data',d=>{if(d.toString().includes('Strata-Core 3D:')){clearTimeout(timer);yes();}});child.on('error',no);});
+ const request=async(path,{cookie,method='GET',body,headers={}}={})=>{const response=await fetch(origin+'/api'+path,{method,headers:{Origin:origin,...(cookie?{Cookie:cookie}:{}),...(body?{'Content-Type':'application/json'}:{}),...headers},body:body===undefined?undefined:typeof body==='string'||Buffer.isBuffer(body)?body:JSON.stringify(body)});const text=await response.text();let data;try{data=JSON.parse(text);}catch{data=text;}return{status:response.status,data,cookie:response.headers.get('set-cookie')?.split(';')[0],headers:response.headers};};
+ let buyer,vendor,other,admin,product,file;
+ const register=async(name,role)=>{const r=await request('/register',{method:'POST',body:{name,email:name+'@example.test',password:'test-passphrase-12345',role}});assert.equal(r.status,200);return r;};
+ await t.test('public catalog, search, and real sample files',async()=>{const r=await request('/products');assert.equal(r.status,200);assert.equal(r.data.length,8);const free=await request('/products?free=true');assert.equal(free.data.length,2);const search=await request('/products?q=Chair');assert.equal(search.data.length,1);});
+ await t.test('registration prevents administrator self-assignment',async()=>{buyer=await register('buyer','admin');assert.equal(buyer.data.user.role,'buyer');assert.match(buyer.headers.get('set-cookie'),/HttpOnly/);vendor=await register('vendor','vendor');other=await register('other','vendor');admin=await register('owner','buyer');const result=spawnSync(process.execPath,['scripts/admin.mjs','owner@example.test'],{env});assert.equal(result.status,0);});
+ await t.test('private routes reject anonymous and buyer access',async()=>{assert.equal((await request('/admin')).status,401);assert.equal((await request('/admin',{cookie:buyer.cookie})).status,403);assert.equal((await request('/vendor/products',{cookie:buyer.cookie})).status,403);assert.equal((await request('/download/sample-car',{cookie:buyer.cookie})).status,403);});
+ await t.test('cross-site writes and duplicate accounts are rejected',async()=>{assert.equal((await request('/cart',{method:'POST',cookie:buyer.cookie,headers:{Origin:'https://evil.example'},body:{product_id:'sample-car'}})).status,403);assert.equal((await request('/register',{method:'POST',body:{name:'Duplicate',email:'buyer@example.test',password:'test-passphrase-12345'}})).status,409);});
+ await t.test('wrong passwords fail and valid login works',async()=>{assert.equal((await request('/login',{method:'POST',body:{email:'buyer@example.test',password:'incorrect-password'}})).status,401);assert.equal((await request('/login',{method:'POST',body:{email:'buyer@example.test',password:'test-passphrase-12345'}})).status,200);});
+ await t.test('uploads require vendor role and reject executable and fake images',async()=>{const options={method:'POST',headers:{'X-File-Name':'test.obj','Content-Type':'application/octet-stream'},body:'v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3'};assert.equal((await request('/upload',{...options,cookie:buyer.cookie})).status,403);assert.equal((await request('/upload',{...options,cookie:vendor.cookie,headers:{'X-File-Name':'bad.exe'}})).status,400);assert.equal((await request('/upload',{...options,cookie:vendor.cookie,headers:{'X-File-Name':'bad.png'}})).status,400);file=await request('/upload',{...options,cookie:vendor.cookie});assert.equal(file.status,201);});
+ const listing=()=>({title:'Test Triangle',description:'An original triangle for integration testing.',category:'Props',price:1500,polygons:1,rigged:false,file_id:file.data.id});
+ await t.test('vendors cannot use another vendor’s file or list negative prices',async()=>{assert.equal((await request('/vendor/products',{method:'POST',cookie:other.cookie,body:listing()})).status,400);assert.equal((await request('/vendor/products',{method:'POST',cookie:vendor.cookie,body:{...listing(),price:-1}})).status,400);});
+ await t.test('uploaded listings start pending and stay hidden from buyers',async()=>{const p=await request('/vendor/products',{method:'POST',cookie:vendor.cookie,body:listing()});assert.equal(p.status,201);product=p.data.id;assert.equal((await request('/products/'+product)).status,404);assert.equal((await request('/products/'+product,{cookie:vendor.cookie})).data.status,'pending');assert.equal((await request('/products/'+product,{cookie:other.cookie})).status,404);});
+ await t.test('only an admin can approve a listing',async()=>{assert.equal((await request('/admin/products/'+product,{method:'PATCH',cookie:vendor.cookie,body:{status:'published'}})).status,403);assert.equal((await request('/admin/products/'+product,{method:'PATCH',cookie:admin.cookie,body:{status:'published'}})).status,200);assert.equal((await request('/products/'+product)).data.status,'published');});
+ await t.test('wishlist and cart persist per account without duplicates',async()=>{for(let i=0;i<2;i++)assert.equal((await request('/cart',{method:'POST',cookie:buyer.cookie,body:{product_id:product}})).status,200);assert.equal((await request('/cart',{cookie:buyer.cookie})).data.length,1);assert.equal((await request('/cart',{cookie:other.cookie})).data.length,0);await request('/wishlist',{method:'POST',cookie:buyer.cookie,body:{product_id:product}});assert.equal((await request('/wishlist',{cookie:buyer.cookie})).data.length,1);});
+ await t.test('checkout uses server prices and grants owner-only download',async()=>{const r=await request('/checkout',{method:'POST',cookie:buyer.cookie,body:{total:1}});assert.equal(r.status,201);assert.equal(r.data.total,1500);assert.equal(r.data.mode,'demo');assert.equal((await request('/cart',{cookie:buyer.cookie})).data.length,0);assert.equal((await request('/library',{cookie:buyer.cookie})).data.length,1);const download=await request('/download/'+product,{cookie:buyer.cookie});assert.equal(download.status,200);assert.match(download.data,/f 1 2 3/);assert.equal((await request('/download/'+product,{cookie:other.cookie})).status,403);assert.equal((await request('/checkout',{method:'POST',cookie:buyer.cookie,body:{}})).status,400);});
+ await t.test('purchased models cannot be bought again',async()=>{assert.equal((await request('/cart',{method:'POST',cookie:buyer.cookie,body:{product_id:product}})).status,400);});
+ await t.test('archiving is owner-only and preserves purchased downloads',async()=>{assert.equal((await request('/vendor/products/'+product,{method:'PATCH',cookie:other.cookie,body:{status:'archived'}})).status,404);assert.equal((await request('/vendor/products/'+product,{method:'PATCH',cookie:vendor.cookie,body:{status:'archived'}})).status,200);assert.equal((await request('/products/'+product)).status,404);assert.equal((await request('/download/'+product,{cookie:buyer.cookie})).status,200);});
+ await t.test('vendors can update only their own storefront',async()=>{assert.equal((await request('/store',{method:'PATCH',cookie:vendor.cookie,body:{store_name:'Triangle Studio',bio:'Original test models.'}})).status,200);const r=await request('/stores/'+vendor.data.user.id);assert.equal(r.data.store_name,'Triangle Studio');assert.equal(r.data.email,undefined);});
+ await t.test('free checkout and real OBJ download work',async()=>{await request('/cart',{method:'POST',cookie:buyer.cookie,body:{product_id:'sample-tree'}});const r=await request('/checkout',{method:'POST',cookie:buyer.cookie,body:{}});assert.equal(r.data.mode,'free');assert.equal(r.data.total,0);const d=await request('/download/sample-tree',{cookie:buyer.cookie});assert.match(d.data,/^# Strata-Core/);assert.match(d.headers.get('content-disposition'),/attachment/);});
+ await t.test('logout invalidates the server-side session',async()=>{await request('/logout',{method:'POST',cookie:buyer.cookie,body:{}});assert.equal((await request('/library',{cookie:buyer.cookie})).status,401);});
+ await t.test('production disables demo payments and preserves persisted data',async()=>{
+  const livePort=port+2500,liveOrigin=`http://localhost:${livePort}`;
+  const live=spawn(process.execPath,['server/index.mjs'],{env:{...env,PORT:String(livePort),APP_ORIGIN:liveOrigin,NODE_ENV:'production',DEMO_CHECKOUT:'true'},stdio:['ignore','pipe','pipe']});
+  try{
+   await new Promise((yes,no)=>{const timer=setTimeout(()=>no(new Error('Production test server failed to start')),10000);live.stdout.on('data',d=>{if(d.toString().includes('Strata-Core 3D:')){clearTimeout(timer);yes();}});live.on('error',no);});
+   const liveRequest=async(path,options={})=>{const r=await fetch(liveOrigin+'/api'+path,{...options,headers:{Origin:liveOrigin,'Content-Type':'application/json',Cookie:vendor.cookie,...options.headers}});return{status:r.status,data:await r.json(),headers:r.headers};};
+   assert.equal((await liveRequest('/session')).data.demo,false);
+   assert.equal((await liveRequest('/store',{method:'PATCH',body:JSON.stringify({store_name:'Persistent Studio',bio:'Persisted data test.'})})).status,200);
+   assert.equal((await request('/stores/'+vendor.data.user.id)).data.store_name,'Persistent Studio');
+   await liveRequest('/cart',{method:'POST',body:JSON.stringify({product_id:'sample-car'})});
+   assert.equal((await liveRequest('/checkout',{method:'POST',body:'{}'})).status,503);
+   assert.equal((await liveRequest('/library')).data.length,0);
+   assert.equal((await liveRequest('/cart')).data.length,1);
+   const login=await liveRequest('/login',{method:'POST',body:JSON.stringify({email:'vendor@example.test',password:'test-passphrase-12345'})});
+   assert.match(login.headers.get('set-cookie'),/Secure/);
+  }finally{live.kill();if(live.exitCode===null)await once(live,'exit');}
+ });
+});

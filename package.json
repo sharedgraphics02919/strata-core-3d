@@ -1,0 +1,14 @@
+{
+  "name": "strata-core-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An independent 3D model marketplace starter",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/index.mjs",
+    "dev": "node --env-file-if-exists=.env --watch server/index.mjs",
+    "test": "node --test test/*.test.mjs",
+    "admin": "node --env-file-if-exists=.env scripts/admin.mjs"
+  }
+}
